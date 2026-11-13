@@ -1,0 +1,24 @@
+{
+  "name": "netrecon",
+  "version": "1.0.0",
+  "description": "Headless-browser network traffic reconnaissance for web applications (XHR/Fetch, WebSocket, SSE).",
+  "type": "module",
+  "bin": {
+    "netrecon": "bin/netrecon.js"
+  },
+  "main": "src/recon.js",
+  "scripts": {
+    "start": "node bin/netrecon.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "25.17.0"
+  },
+  "devDependencies": {
+    "ws": "8.23.0"
+  }
+}
