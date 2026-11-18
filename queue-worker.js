@@ -6,14 +6,18 @@
  *   play            { uuid } -> { ok, playUrl, sessionId } | { ok: false, status, error, details }
  *   check-sessions  {}       -> { ok, sessions: [{ id, loggedIn }] }   (used by /health?deep)
  *
- * Each play job: Redis cache -> pick a session (SessionManager) -> fresh
- * incognito context in the shared Chrome (BrowserPool) -> Narobet init call.
- * Transient failures are retried with backoff; a session Narobet rejects is
- * benched and the job moves on to another account. Successes are cached so
- * every request for that game in the next 4 minutes is answered from Redis.
+ * Each play job: Redis cache -> pick a session (SessionManager) -> that
+ * account's warm incognito page in the shared Chrome (BrowserPool) -> one
+ * Narobet init call. Accounts never share a context; jobs for the same
+ * account share its page (CONTEXT_MODE=job gives every job a fresh context
+ * instead, which is about 6x slower). Transient failures are retried with
+ * backoff; a session Narobet rejects is benched, its page dropped, and the job
+ * moves on to another account. Successes are cached (unless the API asked for
+ * single-use links) so repeat requests in the next 4 minutes skip Narobet.
  *
  * Expected failures are returned as { ok: false, … } rather than thrown, so
- * server.js can answer with the right HTTP status.
+ * server.js can answer with the right HTTP status. Every result carries
+ * durationMs, which the API uses to estimate how much work fits in its timeout.
  *
  *   node queue-worker.js     (needs Redis and sessions.json; env vars: src/casino/config.js)
  */
@@ -52,11 +56,29 @@ export async function startWorker(config = loadConfig(), { log = console.log } =
     executablePath: config.executablePath,
     headless: config.headless,
     maxContexts: config.concurrency,
+    pageMaxAgeMs: config.pageMaxAgeMs,
   }, { log });
+
+  /**
+   * Runs `fn(page)` with a Narobet page logged in as `session`: the account's
+   * warm page (CONTEXT_MODE=session) or a fresh incognito context (job).
+   */
+  const withNarobetPage = (session, fn) => (config.contextMode === 'job'
+    ? pool.withContext(async (context) => fn(await openSessionPage(context, session, config)),
+      { timeoutMs: config.attemptTimeoutMs })
+    : pool.withSessionPage(session.id, session.version, (context) => openSessionPage(context, session, config), fn,
+      { timeoutMs: config.attemptTimeoutMs }));
+
+  /** Benches a session Narobet rejected and drops its warm page. */
+  const benchSession = (id, reason) => {
+    sessions.markFailed(id, reason);
+    pool.retirePage(id);
+  };
 
   // Limits stored on the queue apply to every worker process, so running more
   // workers adds capacity for retries/cache but never more load on Narobet.
-  const admin = new Queue(config.queueName, { connection, prefix: config.prefix });
+  // Same event-history length as the API (every Queue instance stores it in Redis).
+  const admin = new Queue(config.queueName, { connection, prefix: config.prefix, streams: { events: { maxLen: config.eventsMaxLen } } });
   admin.on('error', () => {});
   try {
     await withDeadline((async () => {
@@ -82,16 +104,13 @@ export async function startWorker(config = loadConfig(), { log = console.log } =
       const session = sessions.acquire(tried); // throws 401 once every session is benched
       tried.add(session.id);
       try {
-        const playUrl = await pool.withContext(async (context) => {
-          const page = await openSessionPage(context, session, config);
-          return requestPlayUrl(page, uuid, config);
-        }, { timeoutMs: config.attemptTimeoutMs });
+        const playUrl = await withNarobetPage(session, (page) => requestPlayUrl(page, uuid, config));
         sessions.markOk(session.id);
         return { playUrl, sessionId: session.id };
       } catch (raw) {
         const err = raw instanceof ApiError ? raw : new ApiError(502, 'Internal browser error', raw.message, { retryable: true });
         if (err.authFailure) {
-          sessions.markFailed(session.id, err.message);
+          benchSession(session.id, err.message);
           // Switching accounts doesn't use up a retry; bounded by the number of sessions.
           if (++switches > sessions.size || closing) throw err;
           attempt--;
@@ -112,17 +131,22 @@ export async function startWorker(config = loadConfig(), { log = console.log } =
     const started = Date.now();
     // Another worker may have filled the cache while this job was queued.
     const cached = shareable ? await cache.get(uuid) : null;
-    if (cached) return { ok: true, playUrl: cached.playUrl, sessionId: cached.sessionId, cached: true };
+    if (cached) {
+      return { ok: true, playUrl: cached.playUrl, sessionId: cached.sessionId, fetchedAt: cached.fetchedAt, cached: true, durationMs: Date.now() - started };
+    }
     try {
       const { playUrl, sessionId } = await fetchPlayUrl(uuid);
-      if (shareable) await cache.set(uuid, { playUrl, sessionId });
-      log(`OK   ${uuid} via ${sessionId} (${Date.now() - started}ms)`);
-      return { ok: true, playUrl, sessionId, cached: false };
+      const fetchedAt = Date.now();
+      if (shareable) await cache.set(uuid, { playUrl, sessionId, fetchedAt });
+      const durationMs = Date.now() - started;
+      if (config.logJobs) log(`OK   ${uuid} via ${sessionId} (${durationMs}ms)`);
+      // durationMs feeds the API's capacity estimate (how many queued jobs can finish in time).
+      return { ok: true, playUrl, sessionId, fetchedAt, cached: false, durationMs };
     } catch (err) {
       const result = toErrorResult(err);
       const details = result.details === undefined ? '' : ` – ${typeof result.details === 'string' ? result.details : JSON.stringify(result.details)}`;
       log(`FAIL ${uuid} (${Date.now() - started}ms): ${result.error}${details}`);
-      return result;
+      return { ...result, durationMs: Date.now() - started };
     }
   }
 
@@ -130,12 +154,9 @@ export async function startWorker(config = loadConfig(), { log = console.log } =
   async function processCheckSessions() {
     const results = await Promise.all(sessions.sessions.map(async (session) => {
       try {
-        const loggedIn = await pool.withContext(async (context) => {
-          const page = await openSessionPage(context, session, config);
-          return checkLogin(page, config);
-        }, { timeoutMs: config.attemptTimeoutMs });
+        const loggedIn = await withNarobetPage(session, (page) => checkLogin(page, config));
         if (loggedIn === true) sessions.markOk(session.id);
-        if (loggedIn === false) sessions.markFailed(session.id, 'Logged out (session check)');
+        if (loggedIn === false) benchSession(session.id, 'Logged out (session check)');
         return { id: session.id, loggedIn };
       } catch (err) {
         return { id: session.id, loggedIn: null, error: err.message };

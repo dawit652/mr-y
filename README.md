@@ -92,17 +92,18 @@ test/                    integration test and local fixture server
 `GET /play/:uuid` turns a Narobet game UUID into a launch URL (`{ success, playUrl }`). It runs as two processes:
 
 ```
-client ─▶ server.js ──(Redis cache hit, 4 min)──▶ response
-              │ miss
+client ─▶ server.js ──(cache hit: memory, then Redis; 4 min)──▶ response
+              │ miss: admitted only if it can finish in time, else 503 + Retry-After
               ▼
-        BullMQ queue (Redis) ──▶ queue-worker.js ──▶ shared Chrome, one incognito
-                                  (max 5 jobs at once,    context per job, cookies from
-                                   across all workers)    a rotating sessions.json account
+        BullMQ queue (Redis) ──▶ queue-worker.js ──▶ shared Chrome: one warm incognito
+                                  (max 5 jobs at once,    page per account, shared by that
+                                   across all workers)    account's jobs (rotating accounts)
 ```
 
-- `server.js` never starts Chrome. It answers from the Redis cache, otherwise it enqueues a job and waits for it. Requests for the same game at the same time share one job. When the queue is too deep it answers 503 with `Retry-After`. A request that waits longer than `REQUEST_TIMEOUT_MS` gets 504, but its job keeps running and caches the result.
-- `queue-worker.js` processes up to 5 jobs at once. The cap is stored in Redis, so it covers all worker processes together. Each job uses a fresh incognito context in one shared Chrome and the next account from `sessions.json`. A session Narobet rejects is benched and the job moves on to another account. Transient errors are retried with backoff.
-- `GET /health` reports Redis, the queue and the worker count. `GET /health?deep` also checks every session's login.
+- `server.js` never starts Chrome. It answers from the cache (its own memory first, then Redis). Otherwise it enqueues a job and waits for it. Requests for the same game at the same time share one lookup and one job.
+- Admission control: workers report how long jobs take, so the API knows how many queued jobs can still finish within `REQUEST_TIMEOUT_MS`. A request past that is not queued. It gets `503` at once with a `Retry-After`, spread out so turned-away clients come back at about the rate capacity frees up. Admitted requests therefore finish in time, and a burst of thousands is handled cheaply. A request that still waits too long gets `504`. Its job keeps running, and with caching on, the retry is a cache hit.
+- `queue-worker.js` processes up to 5 jobs at once. The cap is stored in Redis, so it covers all worker processes together. Each account gets one warm incognito page that its jobs share, so a job is a single Narobet call. Accounts never share a context. With `CONTEXT_MODE=job`, every job gets a fresh context instead, which is about 6x slower. A session Narobet rejects is benched, its page is dropped, and the job moves on to another account. Transient errors are retried with backoff.
+- `GET /health` reports Redis, the queue, the worker count, the cache, memory, and `capacity`. `capacity` includes the live `jobsPerSec`, `safeQueue` (how many requests can be in line and still be served in time) and the count of requests turned away. `GET /health?deep` also checks every session's login.
 
 Setup:
 
@@ -112,7 +113,33 @@ Setup:
 
 Launch links: by default a link is reused for 4 minutes, and simultaneous requests for the same game share one Narobet call. If Narobet links are single-use, set `CACHE_TTL_SEC=0`. Then every request gets its own fresh link (the response header is `X-Cache: OFF`), nothing is cached, and the API's setting applies even if the worker's differs.
 
-Settings come from env vars, listed in `src/casino/config.js`. The main ones are `REDIS_URL`, `PORT`, `WORKER_CONCURRENCY`, `GLOBAL_CONCURRENCY`, `RATE_LIMIT_MAX`, `CACHE_TTL_SEC`, `SESSION_STRATEGY` (`round-robin` or `random`) and `REQUEST_TIMEOUT_MS`.
+Settings come from env vars, listed in `src/casino/config.js`. The main ones are:
+
+- `REDIS_URL`, `PORT`
+- `WORKER_CONCURRENCY` and `GLOBAL_CONCURRENCY`: jobs at once per worker and across all workers
+- `RATE_LIMIT_MAX`
+- `CACHE_TTL_SEC`
+- `SESSION_STRATEGY`: `round-robin` or `random`
+- `CONTEXT_MODE`: `session` or `job`
+- `REQUEST_TIMEOUT_MS` and `CAPACITY_SAFETY`: admit only work that fits in this share of the timeout (default 0.8)
+- `MAX_WAITING`: a hard cap on queued jobs
+- `LOG_JOBS=false`: stops logging every successful job
+
+### Capacity (measured)
+
+These numbers come from a 4-core Windows 10 Home laptop running one API process, one worker, Redis in Docker and a fake Narobet. "Simultaneous" means every request was sent at the same instant, each on its own new connection.
+
+| Setup | Links per second | Served within the 45s timeout | The rest |
+| --- | --- | --- | --- |
+| Single-use links (`CACHE_TTL_SEC=0`), concurrency 5, Narobet answering in 150ms | ~27 | about 1,000, in bursts of 2,000, 3,000 and 4,999 | `503` within 3s, `Retry-After` spread over 1–187s |
+| Same, Narobet answering in 400ms | ~12 | 395 of 4,999 | `503` within 3s |
+| Same as the first row, but concurrency 25 and 5 accounts | ~120 | 3,950 of 4,999 | `503` within 6s |
+| Shared links (default), 4,999 requests for 500 games | n/a | all 4,999 in 20s, using 450 Narobet calls | none |
+| Shared links, already cached | n/a | all 4,999 in 2s | none |
+
+Every run had no timeouts (`504`) and no refused connections. Narobet never saw more calls at once than the concurrency setting, every single-use link was unique, and API memory stayed under 170 MB. Before warm pages, the same setup managed about 4 links per second, roughly 200 per 45s.
+
+A rule of thumb for how many simultaneous requests can be served in time: links per second × 36s, where links per second ≈ concurrency ÷ Narobet's response time. `GET /health` shows the live values (`capacity.jobsPerSec`, `capacity.safeQueue`). Raising the concurrency raises that number but also the load on Narobet. Right after a restart the API assumes 1s jobs until the first ones finish, so for the first few seconds it admits fewer requests (180 at concurrency 5).
 
 Tests: `test/casino-queue.test.js` runs everything end to end against a fake Narobet. It needs Redis (`TEST_REDIS_URL`, default `redis://127.0.0.1:6379/15`), only touches keys under its own prefix, and is skipped when Redis is down.
 

@@ -101,6 +101,19 @@ describe('SessionManager', () => {
     assert.equal(m.acquire().cookies[0].value, '2');
   });
 
+  test('a session version changes only when its cookies or user agent change', async () => {
+    write([{ id: 'a', cookies: 'x=1' }, { id: 'b', cookies: 'y=1' }]);
+    const m = make();
+    m.load();
+    const [a1, b1] = [m.acquire().version, m.acquire().version];
+    assert.match(a1, /^[0-9a-f]{16}$/);
+    write([{ id: 'a', cookies: 'x=1' }, { id: 'b', cookies: 'y=2' }]);
+    m.load();
+    const [a2, b2] = [m.acquire().version, m.acquire().version];
+    assert.equal(a2, a1);
+    assert.notEqual(b2, b1);
+  });
+
   test('keeps the old sessions when the edited file is broken', () => {
     write([{ id: 'a', cookies: 'x=1' }]);
     const m = make();

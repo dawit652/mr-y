@@ -145,6 +145,8 @@ describe('queued casino API', { skip: redisDown || false }, () => {
     assert.equal(first.body.success, true);
     assert.match(first.body.playUrl, new RegExp(`g=${uuid}`));
     assert.equal(first.headers.get('x-cache'), 'MISS');
+    assert.equal(first.headers.get('access-control-allow-origin'), '*');
+    assert.match(first.headers.get('content-type'), /application\/json/);
 
     const t = Date.now();
     const second = await get(`/play/${uuid}`);
@@ -176,7 +178,30 @@ describe('queued casino API', { skip: redisDown || false }, () => {
     assert.ok(fake.state.maxInFlight <= 5, `max in flight was ${fake.state.maxInFlight}`);
     assert.ok(fake.state.maxInFlight >= 2, 'jobs should run in parallel');
     assert.equal(worker.pool.launches, 1);
-    assert.equal(worker.pool.status().activeContexts, 0, 'every context is closed afterwards');
+    assert.equal(worker.pool.status().active, 0, 'no work left running afterwards');
+  });
+
+  test('warm session pages: jobs reuse one page per account instead of loading a page each', async () => {
+    const before = fake.state.pageLoads;
+    const rs = await Promise.all(Array.from({ length: 12 }, () => get(`/play/${newUuid()}`)));
+    for (const r of rs) assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(fake.state.pageLoads - before, 0, 'pages from earlier tests are reused');
+    assert.equal(worker.pool.status().sessionPages, 2);
+  });
+
+  test('two API instances share one job for the same game', async () => {
+    const api2 = await startServer(config, { log: () => {} });
+    try {
+      const uuid = newUuid();
+      const rs = await Promise.all([
+        ...Array.from({ length: 5 }, () => get(`/play/${uuid}`)),
+        ...Array.from({ length: 5 }, () => get(`/play/${uuid}`, api2.url)),
+      ]);
+      for (const r of rs) assert.equal(r.status, 200, JSON.stringify(r.body));
+      assert.equal(fake.calls[uuid], 1);
+    } finally {
+      await api2.close();
+    }
   });
 
   test('load is spread across sessions', () => {
@@ -257,7 +282,10 @@ describe('queued casino API', { skip: redisDown || false }, () => {
   test('recovers after Chrome crashes', async () => {
     const before = worker.pool.launches;
     worker.pool.browser.process().kill('SIGKILL');
-    await new Promise((r) => setTimeout(r, 500));
+    // Puppeteer notices the dead browser asynchronously; under load that can take a while.
+    for (const t0 = Date.now(); worker.pool.status().browser !== 'stopped' && Date.now() - t0 < 10_000;) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
     const r = await get(`/play/${newUuid()}`);
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.equal(worker.pool.launches, before + 1);
@@ -283,12 +311,34 @@ describe('queued casino API', { skip: redisDown || false }, () => {
     }
   });
 
+  test('admission control: a burst beyond capacity gets fast 503s, admitted requests all succeed', async () => {
+    // 3s timeout and a 1s job guess -> about 10 jobs can finish in time.
+    const small = await startServer({ ...config, cacheTtlSec: 0, requestTimeoutMs: 3_000, initialJobMs: 1_000 }, { log: () => {} });
+    try {
+      const uuids = Array.from({ length: 40 }, () => newUuid());
+      const t = Date.now();
+      const rs = await Promise.all(uuids.map((u) => get(`/play/${u}`, small.url)));
+      const by = (s) => rs.filter((r) => r.status === s);
+      assert.equal(by(504).length, 0, 'admitted requests must not time out');
+      assert.equal(by(200).length + by(503).length, 40, JSON.stringify(rs.map((r) => r.status)));
+      assert.ok(by(200).length >= 5, `only ${by(200).length} admitted`);
+      assert.ok(by(503).length >= 10, `only ${by(503).length} shed`);
+      for (const r of by(503)) assert.ok(Number(r.headers.get('retry-after')) >= 1);
+      assert.ok(Date.now() - t < 3_000);
+      const upstream = uuids.reduce((n, u) => n + (fake.calls[u] || 0), 0);
+      assert.equal(upstream, by(200).length, 'shed requests never reach Narobet');
+      assert.equal(small.launcher.status().requests.shed, by(503).length);
+    } finally {
+      await small.close();
+    }
+  });
+
   test('answers 503 + Retry-After when the queue is full', async () => {
     const full = await startServer({ ...config, maxWaiting: 0 }, { log: () => {} });
     try {
       const r = await get(`/play/${newUuid()}`, full.url);
       assert.equal(r.status, 503);
-      assert.equal(r.headers.get('retry-after'), '5');
+      assert.ok(Number(r.headers.get('retry-after')) >= 1, 'Retry-After is estimated from capacity');
     } finally {
       await full.close();
     }
@@ -306,5 +356,60 @@ describe('queued casino API', { skip: redisDown || false }, () => {
     const r = await pending;
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.equal(worker.pool.status().browser, 'stopped');
+  });
+});
+
+describe('queued casino API with CONTEXT_MODE=job (fresh incognito context per job)', { skip: redisDown || false }, () => {
+  let fake, api, worker, dir;
+  const prefix = `${PREFIX}-job`;
+  const get = async (p) => {
+    const r = await fetch(api.url + p);
+    return { status: r.status, body: await r.json() };
+  };
+
+  before(async () => {
+    fake = await startFakeNarobet();
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'casino-queue-job-test-'));
+    const sessionsFile = path.join(dir, 'sessions.json');
+    fs.writeFileSync(sessionsFile, JSON.stringify([{ id: 'acct-a', cookies: 'sid=acct-a' }, { id: 'acct-b', cookies: 'sid=acct-b' }]));
+    const config = {
+      ...DEFAULTS, port: 0, redisUrl: REDIS_URL, prefix, baseUrl: fake.url, sessionsFile, contextMode: 'job',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || DEFAULTS.executablePath,
+      upstreamTimeoutMs: 2_000, attemptTimeoutMs: 10_000, requestTimeoutMs: 20_000, retryBaseMs: 50, shutdownGraceMs: 2_000,
+    };
+    worker = await startWorker(config, { log: () => {} });
+    api = await startServer(config, { log: () => {} });
+  });
+
+  after(async () => {
+    await api?.close();
+    await worker?.close();
+    await fake?.close();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    const redis = new Redis(redisOptions(REDIS_URL));
+    let cursor = '0';
+    do {
+      const [next, keys] = await redis.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 500);
+      if (keys.length) await redis.del(...keys);
+      cursor = next;
+    } while (cursor !== '0');
+    redis.disconnect();
+  });
+
+  test('every job loads its own page; at most 5 upstream calls at once; no pages kept', async () => {
+    const rs = await Promise.all(Array.from({ length: 15 }, () => get(`/play/${newUuid()}`)));
+    for (const r of rs) assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(fake.state.pageLoads, 15);
+    assert.ok(fake.state.maxInFlight <= 5, `max in flight was ${fake.state.maxInFlight}`);
+    assert.equal(worker.pool.status().sessionPages, 0);
+  });
+
+  test('a rejected session is benched and another account serves the request', async () => {
+    fake.state.valid.delete('acct-a');
+    for (let i = 0; i < 3; i++) {
+      const r = await get(`/play/${newUuid()}`);
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      assert.match(r.body.playUrl, /s=acct-b/);
+    }
   });
 });

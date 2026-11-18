@@ -16,9 +16,14 @@ export const DEFAULTS = Object.freeze({
   host: '127.0.0.1',                 // HOST
   port: 3200,                        // PORT
   requestTimeoutMs: 45_000,          // REQUEST_TIMEOUT_MS  how long a request waits for its job
-  maxWaiting: 2_000,                 // MAX_WAITING         answer 503 once this many jobs are queued
+  capacitySafety: 0.8,               // CAPACITY_SAFETY     admit jobs that finish within this share of the timeout
+  initialJobMs: 1_000,               //                     job-time guess until workers report real ones
+  maxWaiting: 10_000,                // MAX_WAITING         hard cap on queued jobs, on top of admission control
+  maxConnections: 20_000,            // MAX_CONNECTIONS     open sockets before new ones are dropped
+  keepAliveTimeoutMs: 5_000,         // KEEP_ALIVE_TIMEOUT_MS
   shutdownGraceMs: 8_000,            // SHUTDOWN_GRACE_MS   time in-flight requests get on shutdown
   listenBacklog: 4_096,              // LISTEN_BACKLOG      pending TCP connections before refusing
+  memoryCacheEntries: 10_000,        // MEMORY_CACHE_ENTRIES launch URLs kept in API memory (hot games skip Redis)
 
   // Redis, queue and cache
   redisUrl: 'redis://127.0.0.1:6379', // REDIS_URL
@@ -30,6 +35,7 @@ export const DEFAULTS = Object.freeze({
   globalConcurrency: 5,              // GLOBAL_CONCURRENCY  jobs in flight across ALL workers (0 = no cap)
   rateLimitMax: 0,                   // RATE_LIMIT_MAX      max jobs started per window, all workers (0 = off)
   rateLimitWindowMs: 1_000,          // RATE_LIMIT_WINDOW_MS
+  eventsMaxLen: 50_000,              //                     BullMQ event history (the API waits on these events)
 
   // Narobet
   baseUrl: 'https://narobet.bet',    // NAROBET_URL
@@ -43,7 +49,11 @@ export const DEFAULTS = Object.freeze({
   // Browser
   executablePath: 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe', // CHROME_PATH
   headless: true,                    // HEADLESS=false shows the window
+  contextMode: 'session',            // CONTEXT_MODE        session: one warm incognito page per account, shared
+                                     //                     by its jobs (fast); job: fresh context per job
+  pageMaxAgeMs: 30 * 60_000,         // PAGE_MAX_AGE_MS     warm pages are rebuilt after this long
   blockResources: true,              // BLOCK_RESOURCES=false loads images/scripts/css too
+  logJobs: true,                     // LOG_JOBS=false      stop logging every successful job
   navTimeoutMs: 30_000,
   upstreamTimeoutMs: 15_000,         // UPSTREAM_TIMEOUT_MS one Narobet API call
   attemptTimeoutMs: 40_000,          //                     one whole attempt (context + page + call)
@@ -62,9 +72,13 @@ export function loadConfig(env = process.env) {
     host: env.HOST || d.host,
     port: num(env.PORT, d.port),
     requestTimeoutMs: num(env.REQUEST_TIMEOUT_MS, d.requestTimeoutMs),
+    capacitySafety: num(env.CAPACITY_SAFETY, d.capacitySafety),
     maxWaiting: num(env.MAX_WAITING, d.maxWaiting),
+    maxConnections: num(env.MAX_CONNECTIONS, d.maxConnections),
+    keepAliveTimeoutMs: num(env.KEEP_ALIVE_TIMEOUT_MS, d.keepAliveTimeoutMs),
     shutdownGraceMs: num(env.SHUTDOWN_GRACE_MS, d.shutdownGraceMs),
     listenBacklog: num(env.LISTEN_BACKLOG, d.listenBacklog),
+    memoryCacheEntries: num(env.MEMORY_CACHE_ENTRIES, d.memoryCacheEntries),
     redisUrl: env.REDIS_URL || d.redisUrl,
     prefix: env.REDIS_PREFIX || d.prefix,
     queueName: env.QUEUE_NAME || d.queueName,
@@ -80,7 +94,10 @@ export function loadConfig(env = process.env) {
     sessionCooldownMs: num(env.SESSION_COOLDOWN_MS, d.sessionCooldownMs),
     executablePath: env.CHROME_PATH || d.executablePath,
     headless: bool(env.HEADLESS, d.headless),
+    contextMode: env.CONTEXT_MODE === 'job' ? 'job' : d.contextMode,
+    pageMaxAgeMs: num(env.PAGE_MAX_AGE_MS, d.pageMaxAgeMs),
     blockResources: bool(env.BLOCK_RESOURCES, d.blockResources),
+    logJobs: bool(env.LOG_JOBS, d.logJobs),
     upstreamTimeoutMs: num(env.UPSTREAM_TIMEOUT_MS, d.upstreamTimeoutMs),
     retries: num(env.RETRIES, d.retries),
   };

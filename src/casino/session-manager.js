@@ -22,6 +22,7 @@
  *  - Cookie values never appear in logs or status output.
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { ApiError } from './common.js';
 
@@ -81,7 +82,10 @@ export class SessionManager {
       if (entry.userAgent !== undefined && typeof entry.userAgent !== 'string') {
         throw new Error(`${where} (${id}): userAgent must be a string`);
       }
-      return { id, cookies, userAgent: entry.userAgent || null, benchedUntil: 0, lastError: null, ok: 0, failed: 0 };
+      const userAgent = entry.userAgent || null;
+      // Changes whenever the cookies or user agent change, so a warm browser page built from the old ones is replaced.
+      const version = crypto.createHash('sha256').update(JSON.stringify([cookies, userAgent])).digest('hex').slice(0, 16);
+      return { id, version, cookies, userAgent, benchedUntil: 0, lastError: null, ok: 0, failed: 0 };
     });
     this.cursor = 0;
     this.mtimeMs = stat.mtimeMs;
