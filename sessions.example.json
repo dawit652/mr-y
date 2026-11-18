@@ -1,0 +1,13 @@
+[
+  {
+    "id": "acct-1",
+    "cookies": "__Secure-next-auth.session-token=PASTE_VALUE_HERE",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+  },
+  {
+    "id": "acct-2",
+    "cookies": [
+      { "name": "__Secure-next-auth.session-token", "value": "PASTE_VALUE_HERE", "domain": "narobet.bet", "secure": true, "httpOnly": true }
+    ]
+  }
+]

@@ -2,8 +2,9 @@ node_modules/
 output/
 *.log
 
-# Logged-in Chrome profile (session cookies) – never commit
+# Logged-in Chrome profile and account cookies – never commit
 chrome-profile/
+sessions.json
 
 # Local data / generated artifacts
 data/

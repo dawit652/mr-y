@@ -87,6 +87,35 @@ test/                    integration test and local fixture server
 
 `npm test` runs the integration test against the local fixture server (`test/fixture-server.js`, which you can also start by hand with `node test/fixture-server.js`).
 
+## mr-y casino API
+
+`GET /play/:uuid` turns a Narobet game UUID into a launch URL (`{ success, playUrl }`). It runs as two processes:
+
+```
+client ─▶ server.js ──(Redis cache hit, 4 min)──▶ response
+              │ miss
+              ▼
+        BullMQ queue (Redis) ──▶ queue-worker.js ──▶ shared Chrome, one incognito
+                                  (max 5 jobs at once,    context per job, cookies from
+                                   across all workers)    a rotating sessions.json account
+```
+
+- `server.js` never starts Chrome. It answers from the Redis cache, otherwise it enqueues a job and waits for it. Requests for the same game at the same time share one job. When the queue is too deep it answers 503 with `Retry-After`. A request that waits longer than `REQUEST_TIMEOUT_MS` gets 504, but its job keeps running and caches the result.
+- `queue-worker.js` processes up to 5 jobs at once. The cap is stored in Redis, so it covers all worker processes together. Each job uses a fresh incognito context in one shared Chrome and the next account from `sessions.json`. A session Narobet rejects is benched and the job moves on to another account. Transient errors are retried with backoff.
+- `GET /health` reports Redis, the queue and the worker count. `GET /health?deep` also checks every session's login.
+
+Setup:
+
+1. Run Redis 6.2+ (for example `docker run -d -p 6379:6379 redis:7-alpine`).
+2. Create `sessions.json` from a logged-in Chrome profile with `npm run export-session`. It reads `./chrome-profile` and saves it as `acct-1`. For more accounts, run `node export-session.js --profile <dir> --id acct-2`. Close any Chrome using that profile first. If the profile is logged out, the script says so; log in with `node play-game.js` and rerun. You can also write the file by hand from `sessions.example.json`. `sessions.json` is git-ignored, and edits are picked up without a restart.
+3. Start both processes with `npm run worker` and `npm run api`, or with `pm2 start ecosystem.config.cjs`.
+
+Launch links: by default a link is reused for 4 minutes, and simultaneous requests for the same game share one Narobet call. If Narobet links are single-use, set `CACHE_TTL_SEC=0`. Then every request gets its own fresh link (the response header is `X-Cache: OFF`), nothing is cached, and the API's setting applies even if the worker's differs.
+
+Settings come from env vars, listed in `src/casino/config.js`. The main ones are `REDIS_URL`, `PORT`, `WORKER_CONCURRENCY`, `GLOBAL_CONCURRENCY`, `RATE_LIMIT_MAX`, `CACHE_TTL_SEC`, `SESSION_STRATEGY` (`round-robin` or `random`) and `REQUEST_TIMEOUT_MS`.
+
+Tests: `test/casino-queue.test.js` runs everything end to end against a fake Narobet. It needs Redis (`TEST_REDIS_URL`, default `redis://127.0.0.1:6379/15`), only touches keys under its own prefix, and is skipped when Redis is down.
+
 ## Responsible use
 
 Only analyze sites you own or are authorized to test, and respect their terms of service and robots policies.
