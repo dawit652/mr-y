@@ -18,7 +18,14 @@ const opts = {
 
 const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
-const { url, close } = await startServer(opts, { log });
+let started;
+try {
+  started = await startServer(opts, { log });
+} catch (err) {
+  log(`Failed to start: ${err.message}`);
+  process.exit(1);
+}
+const { url, close } = started;
 log(`mr-y Casino API running on ${url}  (GET /play/:uuid, GET /health?deep)`);
 
 let stopping = false;

@@ -168,6 +168,14 @@ describe('casino API', () => {
     assert.equal(r.status, 200, JSON.stringify(r.body));
   });
 
+  test('fails clearly (no crash, no Chrome) when the port is taken', async () => {
+    const port = Number(new URL(api.url).port);
+    await assert.rejects(
+      startServer({ port, userDataDir: profile }, { log: () => {}, warm: false }),
+      /already in use/,
+    );
+  });
+
   test('health reports logged in', async () => {
     const h = await get('/health?deep');
     assert.equal(h.status, 200);

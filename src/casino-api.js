@@ -369,8 +369,15 @@ export async function startServer(opts = {}, { log = console.log, warm = true } 
   const app = createApp(session, { requestTimeoutMs: o.requestTimeoutMs, maxConcurrent: o.maxConcurrent, log });
 
   const server = await new Promise((resolve, reject) => {
-    const s = app.listen(o.port, o.host, () => resolve(s));
-    s.on('error', reject);
+    // Express 5 passes listen errors (e.g. EADDRINUSE) to this callback.
+    const s = app.listen(o.port, o.host, (err) => {
+      if (!err) return resolve(s);
+      if (err.code === 'EADDRINUSE') {
+        err.message = `Port ${o.port} is already in use – is the API already running? `
+          + `Check http://${o.host}:${o.port}/health, stop the other instance, or set PORT.`;
+      }
+      reject(err);
+    });
   });
   const { port } = server.address();
   const url = `http://${o.host}:${port}`;
