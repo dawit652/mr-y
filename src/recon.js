@@ -39,9 +39,12 @@ export async function runRecon(opts, { log = () => {}, signal } = {}) {
   // (typical inside Docker/CI containers).
   if (typeof process.getuid === 'function' && process.getuid() === 0) args.push('--no-sandbox');
   if (profile) args.push(`--window-size=${profile.viewport.width},${profile.viewport.height + 85}`);
+  // Accept self-signed / intercepted (MITM proxy) certificates.
+  args.push('--ignore-certificate-errors', '--ignore-ssl-errors');
 
   log('Launching browser…');
   const browser = await puppeteer.launch({
+    acceptInsecureCerts: true, // Puppeteer >=22 name for the old `ignoreHTTPSErrors`
     headless: opts.headless,
     executablePath: opts.executablePath || undefined,
     args,

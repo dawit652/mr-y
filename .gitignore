@@ -1,3 +1,16 @@
 node_modules/
 output/
 *.log
+
+# Logged-in Chrome profile (session cookies) – never commit
+chrome-profile/
+
+# Local data / generated artifacts
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+catalog.json
+narobet-catalog.json
+captured-request.json
